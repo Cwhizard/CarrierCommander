@@ -31,13 +31,20 @@ function mineCommand.initConfigUI(scrollframe, pos, size)
     pos = pos + vec2(0,35)
 
     local comboBox = scrollframe:createValueComboBox(Rect(pos+vec2(35,5),pos+vec2(200,25)), "onComboBoxSelected")
-    cc.l.uiElementToSettingMap[comboBox.index] = "mineStopOrder"
+    cc.l.uiElementToSettingMap[comboBox.index] = mineCommand.prefix.."mineStopOrder"
     cc.addOrdersToCombo(comboBox)
     pos = pos + vec2(0,35)
 
     local checkBox = scrollframe:createCheckBox(Rect(pos+vec2(0,5),pos+vec2(size.x-35, 25)), "Mine all Asteroids", "onCheckBoxChecked")
-    cc.l.uiElementToSettingMap[checkBox.index] = "mineAllSetting"
-    checkBox.tooltip = "Determines wether all asteroids in a sector (checkded), \nor only resource asteroids (unchecked) will be mined."
+    cc.l.uiElementToSettingMap[checkBox.index] = mineCommand.prefix.."mineAllSetting"
+    checkBox.tooltip = "Determines wether all asteroids in a sector (checked), \nor only resource asteroids (unchecked) will be mined."
+    checkBox.captionLeft = false
+    checkBox.fontSize = 14
+    pos = pos + vec2(0,35)
+
+    local checkBox = scrollframe:createCheckBox(Rect(pos+vec2(0,5),pos+vec2(size.x-35, 25)), "Mine Nearest", "onCheckBoxChecked")
+    cc.l.uiElementToSettingMap[checkBox.index] = mineCommand.prefix.."mineNN"
+    checkBox.tooltip = "Fighters will target the nearest asteroid to the last one mined (checked), \nor the one nearest to the mothership (unchecked)."
     checkBox.captionLeft = false
     checkBox.fontSize = 14
     pos = pos + vec2(0,35)
@@ -75,7 +82,7 @@ function mineCommand.mine()
     local numSquads = 0
     local hangar = Hangar(Entity().index)
     local fighterController = FighterController(Entity().index)
-    if not hangar then cc.applyCurrentAction(mineCommand.prefix, "noHangar") return end
+    if not hangar or hangar.space <= 0 then cc.applyCurrentAction(mineCommand.prefix, "noHangar") return end
 
     local squads = {}
     for _,squad in pairs(mineCommand.squads) do
@@ -93,7 +100,7 @@ end
 
 function mineCommand.getSquadsToManage()
     local hangar = Hangar(Entity().index)
-    if not hangar then cc.applyCurrentAction(mineCommand.prefix, "noHangar") return end
+    if not hangar or hangar.space <= 0 then cc.applyCurrentAction(mineCommand.prefix, "noHangar") return end
     local hasChanged = false
     local oldLength = tablelength(mineCommand.squads)
     local squads = {}
@@ -124,31 +131,99 @@ function mineCommand.findMinableAsteroid()
     local ship = Entity()
     local sector = Sector()
     local oldAstroNum
-    local sourceXYZ
-    
+    local currentPos
+
     if valid(mineCommand.minableAsteroid) then -- because even after the "asteroiddestroyed" event fired it still is part of sector:getEntitiesByType(EntityType.Asteroid) >,<
         oldAstroNum = mineCommand.minableAsteroid.index.number
-        sourceXYZ = mineCommand.minableAsteroid.translationf
-        mineCommand.unregisterTarget()
+        
+        --Cwhizard's Nearest-Neighbor
+        if cc.settings[mineCommand.prefix.."mineNN"] then
+            currentPos = mineCommand.minableAsteroid.translationf
         else
-        sourceXYZ = ship.translationf
+		    currentPos = ship.translationf
+        end
+        --Cwhizard
+
+        mineCommand.unregisterTarget()
+    else
+        currentPos = ship.translationf
     end
 
     mineCommand.minableAsteroid = nil
 
     local asteroids = {sector:getEntitiesByType(EntityType.Asteroid)}
+	 
+	-- if there are no asteroids just return false now and save cpu cycles
+	if next(asteroids) == nil then
+		return false
+	end
+	-- determine if there is more than one roid, also determines maximum possible routelength (kludge)
+	-- which is why we traverse the entire list rather than use len or .count
+	-- we coudl also use some 
+	local roidCount = 0
+	local routelength = 0
+	if currentPos == ship.translationf then
+		for x in pairs(asteroids) do 
+			roidCount = roidCount + 1
+			routelength = routelength + distance2(x.translationf, ship.translationf)
+		end
+	end
     local nearest = math.huge
-    --Go after the asteroid closest to the one just finished (Nearest Neighbor)
-    for _, a in pairs(asteroids) do
-        local resources = a:getMineableResources()
-        if ((resources ~= nil and resources > 0) or cc.settings["mineAllSetting"]) and a.index.number ~= oldAstroNum then
-            local dist = distance2(a.translationf, sourceXYZ)
-            if dist < nearest then
-                nearest = dist
-                mineCommand.minableAsteroid = a
-            end
-        end
-    end
+	if currentPos == ship.translationf and roidcount > 3 and roidcount < 100 then 
+		-- perform search for optimal starting asteroid
+		-- note this is only performed on the first run as in large asteroid fields it
+		-- can cause significant lag.  Essentially it generates the entire nearest neighbor path 
+		-- for each asteroid as the starting point, then determines which path is the shortest
+		-- it will not however do this if the number of asteroids is 100 or more
+		-- its selection sort, but its the only sort that really works based 
+		-- on the fact the order is dependent on changing values based on the existing prior order
+		-- in other words the proper sort order of the remaining elements depends on the elements 
+		-- chosen in the previous rounds of sorting, this would be so much easier if lua had real recursion
+		-- TODO - check this code for correctness, I wrote it in the wee hours and I was already exhausted
+		-- Im not sure if the inner loop is complete
+		local temproids
+		local temprock
+		local tempPos = currentPos
+		-- currentPos = temproids[1]
+		for Index=2,roidCount-1,1 -- iterate through every roid as start
+			-- first we set the next roid at the beginning of the table
+			temproids = asteroids -- deep copy, a big performance hog, TODO figure out how to not do this
+			temprock = temproids[Index]
+			temproids[Index] = temproids[1]
+			temproids[1] = temprock
+			for Index2=1,roidCount-2,1 -- for each non primary roid, find the closest remaining
+				if distance2(temproids[Index-1].translationf , temproids[Index2].translationf) < distance2(temproids[Index-1].translationf , temproids[Index].translationf) then
+					temprock = temproids[Index2]
+					temproids[Index2] = temproids[Index]
+					temproids[Index] = temprock
+				end
+			end
+			-- find the length of the path, including 
+			local templength = distance2(currentPos , temproids[1].translationf) + distance2(ship.translationf , temproids[roidcount])
+			for tempvar=1,roidCount-1,1
+				templength = templength + distance2(temproids[tempvar] , temproids[tempvar + 1])
+			end
+			if templength < routelength
+				tempPos = temproids[1]
+				routelength = templength
+			end
+		end
+		
+		currentPos = tempPos
+		
+		else
+		--Go after the asteroid closest to the one just finished (Nearest Neighbor)
+		for _, a in pairs(asteroids) do
+			local resources = a:getMineableResources()
+			if ((resources ~= nil and resources > 0) or cc.settings[mineCommand.prefix.."mineAllSetting"]) and a.index.number ~= oldAstroNum then
+				local dist = distance2(a.translationf, currentPos)
+				if dist < nearest then
+					nearest = dist
+					mineCommand.minableAsteroid = a
+				end
+			end
+		end
+	end
 
     if valid(mineCommand.minableAsteroid) then
         mineCommand.registerTarget()
@@ -161,12 +236,11 @@ end
 function mineCommand.setSquadsIdle()
     local hangar = Hangar(Entity().index)
     local fighterController = FighterController(Entity().index)
-    if not fighterController or not hangar then
-        cc.applyCurrentAction(mineCommand.prefix, "noHangar")
-        return
+    if not fighterController or not hangar or hangar.space <= 0 then
+        return "noHangar"
     end
 
-    local order = cc.settings["mineStopOrder"] or FighterOrders.Return
+    local order = cc.settings[mineCommand.prefix.."mineStopOrder"] or FighterOrders.Return
     local squads = {}
     for _,squad in pairs(mineCommand.squads) do
         fighterController:setSquadOrders(squad, order, Entity().index)
@@ -229,6 +303,10 @@ function mineCommand.activate(button)
         return
     end
     -- space for stuff to do e.g. scanning all squads for suitable fighters/WeaponCategories etc.
+    if not Hangar() or Hangar().space <= 0 then
+        cc.applyCurrentAction(mineCommand.prefix, "noHangar")
+        return
+    end
     mineCommand.squads = {}
     if not mineCommand.getSquadsToManage() then cc.applyCurrentAction(mineCommand.prefix, "targetButNoFighter") return end
     if mineCommand.findMinableAsteroid() then
@@ -247,7 +325,11 @@ function mineCommand.deactivate(button)
     end
     -- space for stuff to do e.g. landing your fighters
     -- When docking: Make sure to not reset template.squads
-    cc.applyCurrentAction(mineCommand.prefix, mineCommand.setSquadsIdle())
+    local list = {mineCommand.setSquadsIdle()}
+    if list[1] == "noHangar" then
+        list[1] = -1
+    end
+    cc.applyCurrentAction(mineCommand.prefix, unpack(list))
     mineCommand.minableAsteroid = nil
 end
 
